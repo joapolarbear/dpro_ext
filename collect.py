@@ -39,7 +39,7 @@ for e_id, event in enumerate(traces["traceEvents"]):
         flow_record[event["id"]][1] = e_id-1
 
 print(json.dumps(pid2info, indent=4))
-min_ts = traces["traceEvents"]["ts"]
+min_ts = traces["traceEvents"][0]["ts"]
 flow_mapping = {}
 for id, (se, te) in flow_record.items():
     # assert se is not None, (id)
@@ -74,12 +74,15 @@ class TraceTreeNode:
         self.childs.append(node)
         node.parent = self
         
-        if node.cuda_ts is not None:
+        self.align_cuda_time_w_child(node)
+    
+    def align_cuda_time_w_child(self, child):
+        if child.cuda_ts is not None:
             if self.cuda_ts is None:
-                self.cuda_ts = node.cuda_ts
-                self.cuda_dur = node.cuda_dur
+                self.cuda_ts = child.cuda_ts
+                self.cuda_dur = child.cuda_dur
             else:
-                self.cuda_dur = node.cuda_ts + node.cuda_dur - self.cuda_ts
+                self.cuda_dur = child.cuda_ts + child.cuda_dur - self.cuda_ts
          
         
 class TraceTree:
@@ -110,6 +113,7 @@ class TraceTree:
                 self.root_nodes.append(new)
                 return True
             else:
+                prev.parent.align_cuda_time_w_child(prev)
                 return self.add_node(prev.parent, new)
         elif new.r <= prev.r:
             # The new node is the child of the current node
@@ -134,6 +138,8 @@ class TraceTree:
         if node.event["cat"] == "cpu_op":
             msg += "* "
         msg += node.event["name"][:100]
+        if node.cuda_ts:
+            msg += f" ({node.cuda_ts - min_ts} - {node.cuda_ts + node.cuda_dur - min_ts})"
         if node.e_id in flow_mapping:
             cuda_event = traces["traceEvents"][flow_mapping[node.e_id]]
             msg += f" --> {cuda_event['name'][:100]}"
