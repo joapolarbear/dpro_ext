@@ -131,9 +131,9 @@ class TraceTree:
     def show(self):
         level = 0
         for node in self.root_nodes:  
-            self.recur_show(node, level)
+            self._recur_show(node, level)
     
-    def recur_show(self, node, level):
+    def _recur_show(self, node, level):
         msg = "\t" * level
         if node.event["cat"] == "cpu_op":
             msg += "* "
@@ -145,7 +145,36 @@ class TraceTree:
             msg += f" --> {cuda_event['name'][:100]}"
         print(msg)
         for child in node.childs: 
-            self.recur_show(child, level+1)
+            self._recur_show(child, level+1)
+    
+    def gen_traces(self):
+        self.trace_name_cnt = {}
+        self.rst_traces = []
+        for node in self.root_nodes:  
+            self._recur_gen_traces(node)
+            
+        return self.rst_traces
+    
+    def _recur_gen_traces(self, node):
+        if node.event["cat"] == "cpu_op" and node.cuda_ts is not None:
+            if node.event["name"] not in self.trace_name_cnt:
+                self.trace_name_cnt[node.event["name"]] = 0
+            else:
+                self.trace_name_cnt[node.event["name"]] += 1
+                
+            self.rst_traces.append({
+                "name": f'{node.event["name"]}_{self.trace_name_cnt[node.event["name"]]}',
+                "ph": "X",
+                "ts": node.cuda_ts,
+                "dur": node.cuda_dur,
+                "cat": "cuda",
+                "pid": pid2info[node.event["pid"]]["process_name"] + " " \
+                    + pid2info[node.event["pid"]]["process_labels"],
+                "tid": pid2info[node.event["pid"]]["threads"][node.event["tid"]]
+            })
+        else:
+            for child in node.childs: 
+                self._recur_gen_traces(child)
 
 
 def event_cmp_func(o1, o2):
@@ -171,10 +200,21 @@ for e_id, event in sorted_traces:
     if event["ph"] == "X":
         # print(event["pid"], event["tid"], event["ts"], event["name"][:100])
         trace_tree_dict[event["pid"]][event["tid"]].add_event(e_id, event)
-            
-
     
 for pid in trace_tree_dict.keys():
     for tid in trace_tree_dict[pid].keys():
         print(f"\n{pid} {tid}")
         trace_tree_dict[pid][tid].show()
+        
+
+rst_traces = []
+for pid in trace_tree_dict.keys():
+    if pid2info[pid]["process_labels"] != "CPU":
+        continue
+    for tid in trace_tree_dict[pid].keys():
+        rst_traces.extend(trace_tree_dict[pid][tid].gen_traces())
+        
+with open("tmp.json", 'w') as fp:
+    json.dump({
+        "traceEvents": rst_traces
+    }, fp, indent=4)
