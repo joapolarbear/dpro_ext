@@ -2,7 +2,8 @@ import os, sys
 import json
 from functools import cmp_to_key
 
-f = "logs/20230911-173618/hhp-test-fvpf5-15683-worker-0_1853.1694424983139.pt.trace.json"
+f = sys.argv[1]
+
 with open(f, 'r') as fp:
     traces = json.load(fp)
 
