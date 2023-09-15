@@ -1,16 +1,18 @@
 import os, sys
 import json
 from functools import cmp_to_key
+import re
 
 f = sys.argv[1]
 
+print("Trace loading ... ")
 with open(f, 'r') as fp:
     traces = json.load(fp)
 
 pid2info = {}
 flow_record = {}
 pid2trace_tree = {}
-
+print("Stat pid info ... ")
 for e_id, event in enumerate(traces["traceEvents"]):
     if event["ph"] == 'M':
         if event["pid"] not in pid2info:
@@ -39,17 +41,19 @@ for e_id, event in enumerate(traces["traceEvents"]):
             flow_record[event["id"]] = [None, None]
         flow_record[event["id"]][1] = e_id-1
 
-print(json.dumps(pid2info, indent=4))
 min_ts = traces["traceEvents"][0]["ts"]
 flow_mapping = {}
-for id, (se, te) in flow_record.items():
+for _id, (se, te) in flow_record.items():
     # assert se is not None, (id)
     # assert te is not None, (id)
     if se is None or te is None:
         continue
     # print(se["name"][:100], "  ->  ", te["name"][:100])
     flow_mapping[se] = te
-    
+
+
+name2decision = {}
+
 class TraceTreeNode:
     def __init__(self, e_id, event):
         self.e_id = e_id
@@ -84,8 +88,8 @@ class TraceTreeNode:
                 self.cuda_dur = child.cuda_dur
             else:
                 self.cuda_dur = child.cuda_ts + child.cuda_dur - self.cuda_ts
-         
-        
+    
+
 class TraceTree:
     def __init__(self):
         self.root_nodes = []
@@ -126,7 +130,7 @@ class TraceTree:
             # The following case is not allowed in the same thread
             # self:   l       r
             # new:      l        r
-            print(prev.event, new.event)
+            # print(prev.event, new.event)
             return False
     
     def show(self):
@@ -151,31 +155,102 @@ class TraceTree:
     def gen_traces(self):
         self.trace_name_cnt = {}
         self.rst_traces = []
-        for node in self.root_nodes:  
-            self._recur_gen_traces(node)
-            
+        print("\n########### Interactive generate events #########")
+        for node in self.root_nodes:
+            while True:
+                events, next_child = self._recur_gen_traces(node, [])
+                if next_child:
+                    self.rst_traces.extend(events)
+                    break
         return self.rst_traces
-    
-    def _recur_gen_traces(self, node):
-        if node.event["cat"] == "cpu_op" and node.cuda_ts is not None:
-            if node.event["name"] not in self.trace_name_cnt:
-                self.trace_name_cnt[node.event["name"]] = 0
+
+    def _recur_gen_traces(self, node, parents):
+        if node.cuda_ts is None or node.event["name"].startswith("<built-in method"):
+            ret_next_child = True
+            ret_events = []
+            for child in node.childs:
+                events, next_child = self._recur_gen_traces(child, parents + [node])
+                if next_child:
+                    ret_events.extend(events)
+                else:
+                    ret_next_child = False
+                    break
+            return ret_events, ret_next_child
+        
+        match = re.search(r"(?P<module_name>nn.Module:.*)_\d+", node.event["name"])
+        if match is not None:
+            node.event["name"] = match.groupdict()["module_name"]
+        match = re.search(r"(?P<module_name>autograd::engine::evaluate_function:.*)\d+", node.event["name"])
+        if match is not None:
+            node.event["name"] = match.groupdict()["module_name"]
+        while True:
+            # node.cuda_ts is not None
+            if node.event["name"] in name2decision:
+                # We have seen events with the same, directly make the decision
+                decision = name2decision[node.event["name"]]
+                # print(f"Re-use the decsion {decision} for node {node.event['name'][:200]}")
             else:
-                self.trace_name_cnt[node.event["name"]] += 1
+                while True:
+                    print()
+                    for level, p_node in enumerate(parents):
+                        print("    " * level + p_node.event["name"][:200])
+                    print("    " * (len(parents)-1) + f" == {node.event['name'][:200]} ==")
+                    print(f" 0. Show full name of the node")
+                    print(f" 1. Generate a event")
+                    print(f" 2. (default) Breakdown")
+                    print(f" 3. UP")
+                    inp = input("Please input 0/1/2/3:")
+                    if len(inp) == 0:
+                        inp = "2"
+                    if inp == '0':
+                        print(f"The full name is: {node.event['name']}")
+                    elif inp == "3":
+                        return None, False
+                    elif inp not in ["1", "2"]:
+                        print(f"\n!!! Invalid selection: {inp}")
+                    else:
+                        decision = inp
+                        break
+            
+            name2decision[node.event["name"]] = decision
+            if decision == "1":
+                event = self.gen_event_one_node(node)
+                return [event], True
+            elif decision == "2":
+                go_back_to_parent = False
+                ret_events = []
+                for child in node.childs: 
+                    events, next_child = self._recur_gen_traces(child, parents + [node])
+                    if next_child:
+                        ret_events.extend(events)
+                    else:
+                        go_back_to_parent = True
+                        if node.event["name"] in name2decision:
+                            name2decision.pop(node.event["name"])
+                        break
+                if not go_back_to_parent:
+                    return ret_events, True
+        raise RuntimeError("Not expected")
                 
-            self.rst_traces.append({
-                "name": f'{node.event["name"]}_{self.trace_name_cnt[node.event["name"]]}',
-                "ph": "X",
-                "ts": node.cuda_ts,
-                "dur": node.cuda_dur,
-                "cat": "cuda",
-                "pid": pid2info[node.event["pid"]]["process_name"] + " " \
-                    + pid2info[node.event["pid"]]["process_labels"],
-                "tid": pid2info[node.event["pid"]]["threads"][node.event["tid"]]
-            })
+    def gen_event_one_node(self, node):
+        if node.event["name"] not in self.trace_name_cnt:
+            self.trace_name_cnt[node.event["name"]] = 0
         else:
-            for child in node.childs: 
-                self._recur_gen_traces(child)
+            self.trace_name_cnt[node.event["name"]] += 1
+            
+        return {
+            "name": node.event["name"],
+            "ph": "X",
+            "ts": node.cuda_ts,
+            "dur": node.cuda_dur,
+            "cat": "cuda",
+            "pid": pid2info[node.event["pid"]]["process_name"] + " " \
+                + pid2info[node.event["pid"]]["process_labels"],
+            "tid": pid2info[node.event["pid"]]["threads"][node.event["tid"]],
+            "args": {
+                "name": f'{node.event["name"]}_{self.trace_name_cnt[node.event["name"]]}'
+            }
+        }
 
 
 def event_cmp_func(o1, o2):
@@ -201,11 +276,12 @@ for e_id, event in sorted_traces:
     if event["ph"] == "X":
         # print(event["pid"], event["tid"], event["ts"], event["name"][:100])
         trace_tree_dict[event["pid"]][event["tid"]].add_event(e_id, event)
-    
-for pid in trace_tree_dict.keys():
-    for tid in trace_tree_dict[pid].keys():
-        print(f"\n{pid} {tid}")
-        trace_tree_dict[pid][tid].show()
+
+# Show trace trees
+# for pid in trace_tree_dict.keys():
+#     for tid in trace_tree_dict[pid].keys():
+#         print(f"\n{pid} {tid}")
+#         trace_tree_dict[pid][tid].show()
         
 
 rst_traces = []
@@ -215,7 +291,12 @@ for pid in trace_tree_dict.keys():
     for tid in trace_tree_dict[pid].keys():
         rst_traces.extend(trace_tree_dict[pid][tid].gen_traces())
         
-with open("tmp.json", 'w') as fp:
+output_file = "tmp.json"
+print(f"Dump {len(rst_traces)} events to {output_file}") 
+with open(output_file, 'w') as fp:
     json.dump({
         "traceEvents": rst_traces
     }, fp, indent=4)
+
+with open("name2decision_cfg.json", 'w') as fp:
+    json.dump(name2decision, fp, indent=4)
