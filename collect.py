@@ -53,6 +53,11 @@ for _id, (se, te) in flow_record.items():
 
 
 name2decision = {}
+name2decision_cfg_path = "name2decision_cfg.json"
+if os.path.exists(name2decision_cfg_path):
+    with open(name2decision_cfg_path, 'r') as fp:
+        name2decision = json.load(fp)
+    print(f"Load name2decision cfg file from {name2decision_cfg_path}")
 
 class TraceTreeNode:
     def __init__(self, e_id, event):
@@ -233,24 +238,49 @@ class TraceTree:
         raise RuntimeError("Not expected")
                 
     def gen_event_one_node(self, node):
+        name_prefix = None
+        match = re.search(r"nn.Module: (?P<module_name>.*)", node.event["name"])
+        if match is not None:
+            node.event["name"] = match.groupdict()["module_name"]
+            name_prefix = "nn.Module: "
+        match = re.search(r"autograd::engine::evaluate_function: (?P<module_name>.*)", node.event["name"])
+        if match is not None:
+            node.event["name"] = match.groupdict()["module_name"]
+            name_prefix = "autograd::engine::evaluate_function: "
+        match = re.search(r"(?P<name_prefix>.*\.py\(\d+\): )(?P<module_name>.*)", node.event["name"])
+        if match is not None:
+            match_rst = match.groupdict()
+            node.event["name"] = match_rst["module_name"]
+            name_prefix = match_rst["name_prefix"]
+            
         if node.event["name"] not in self.trace_name_cnt:
             self.trace_name_cnt[node.event["name"]] = 0
         else:
             self.trace_name_cnt[node.event["name"]] += 1
-            
-        return {
+        
+        pid = pid2info[node.event["pid"]]["process_name"] + " " \
+                + pid2info[node.event["pid"]]["process_labels"]
+        tid = pid2info[node.event["pid"]]["threads"][node.event["tid"]]
+        if node.event["name"] == "isend":
+            tid += " SEND"
+        elif node.event["name"] == "irecv":
+            tid += " RECV"
+        
+        event = {
             "name": node.event["name"],
             "ph": "X",
             "ts": node.cuda_ts,
             "dur": node.cuda_dur,
             "cat": "cuda",
-            "pid": pid2info[node.event["pid"]]["process_name"] + " " \
-                + pid2info[node.event["pid"]]["process_labels"],
-            "tid": pid2info[node.event["pid"]]["threads"][node.event["tid"]],
+            "pid": pid,
+            "tid": tid,
             "args": {
                 "name": f'{node.event["name"]}_{self.trace_name_cnt[node.event["name"]]}'
             }
         }
+        if name_prefix is not None:
+            event["args"]["name_prefix"] = name_prefix
+        return event
 
 
 def event_cmp_func(o1, o2):
@@ -298,5 +328,6 @@ with open(output_file, 'w') as fp:
         "traceEvents": rst_traces
     }, fp, indent=4)
 
-with open("name2decision_cfg.json", 'w') as fp:
+
+with open(name2decision_cfg_path, 'w') as fp:
     json.dump(name2decision, fp, indent=4)
