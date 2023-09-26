@@ -94,7 +94,20 @@ class TraceTreeNode:
             else:
                 self.cuda_dur = child.cuda_ts + child.cuda_dur - self.cuda_ts
     
-
+'''
+The profiler allow users to specify the granularity for trace recording
+when analyzing the raw output of torch's Profiler in an offline manner. 
+E.g., given a torch module A containing op B, another module C, current 
+profilers supports to record the CUDA runtime corresponding to 
+1) module A; 
+2) op B and module C. 
+The reason to to this is that with Torch, users usually implement their 
+own modules and one module may invoke another module. Torch's Profiler 
+will record the call stack, from the highest level - the module represe
+nting the DNN model - to the lowest level - CPU event to launch a CUDA 
+kernel. It's hard to decide which modules and operators users may be 
+intrested in when analzing the traces.
+'''
 class TraceTree:
     def __init__(self):
         self.root_nodes = []
