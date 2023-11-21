@@ -28,16 +28,53 @@ def load(log_dir):
     files = os.listdir(torch_profiler_dir)
     assert len(files) == 1
     torch_profiler_path = os.path.join(torch_profiler_dir, (files[0]))
-    torch_traces = load_torch_profiler_rst(torch_profiler_path)
+    torch_traces = load_torch_profiler_rst(torch_profiler_path)["traceEvents"]
     return metadata, torch_traces
 
 metadata, torch_traces = load(log_dir)
 
+class Flow:
+    def __init__(self, id, cat, in_e_id=None, out_e_id=None):
+        self.id = id
+        self.cat = cat
+        self.in_e_id = in_e_id
+        self.out_e_id = out_e_id
+        # Full module name, only for fwd2bwd flows
+        self.fullname = None
+        
+    @property
+    def is_cpu2gpu(self):
+        return self.cat == "ac2g"
+
+    @property
+    def is_fwd2bwd(self):
+        return self.cat == "fwdbwd"
+        
+    def register_in_event(self, in_e_id: int):
+        # Register an event that starts a flow
+        self.in_e_id = in_e_id
+        if "in_flow_ids" not in torch_traces[in_e_id]["args"]:
+            torch_traces[in_e_id]["args"]["in_flow_ids"] = [self.id]
+        else:
+            torch_traces[in_e_id]["args"]["in_flow_ids"].append(self.id)
+    
+    def register_out_event(self, out_e_id: int):
+        # Register an event that ends a flow
+        self.out_e_id = out_e_id
+        if "out_flow_ids" not in torch_traces[out_e_id]["args"]:
+            torch_traces[out_e_id]["args"]["out_flow_ids"] = [self.id]
+        else:
+            torch_traces[out_e_id]["args"]["out_flow_ids"].append(self.id)
+            
+    def register_fullname(self, fullname):
+        self.fullname = fullname
+        
+        
 def extract_pid_and_flow_info(traces):
     pid2info = {}
-    flow_id_to_events = {}
+    flow_keyed_by_id = {}
     print("Stat pid info ... ")
-    for e_id, event in enumerate(traces["traceEvents"]):
+    for e_id, event in enumerate(traces):
         if event["ph"] == 'M':
             if event["pid"] not in pid2info:
                 pid2info[event["pid"]] = {"threads": {}}
@@ -48,35 +85,26 @@ def extract_pid_and_flow_info(traces):
             elif event["name"] == "thread_name":
                 pid2info[event["pid"]]["threads"][event["tid"]] = event["args"]["name"]
         elif event["ph"] == "s":
-            source_event = traces["traceEvents"][e_id-1]
+            source_event = traces[e_id-1]
             assert source_event["pid"] == event["pid"]
             assert source_event["tid"] == event["tid"]
             assert source_event["ts"] == event["ts"]
             # TODO what's the usage of the `cat` and `name` fields for this flow evnet
-            if event["id"] not in flow_id_to_events:
-                flow_id_to_events[event["id"]] = [None, None, event["cat"]]
-            flow_id_to_events[event["id"]][0] = e_id-1
+            if event["id"] not in flow_keyed_by_id:
+                flow_keyed_by_id[event["id"]] = Flow(event["id"], event["cat"])
+            flow_keyed_by_id[event["id"]].register_in_event(e_id-1)
         elif event["ph"] == "f":
-            target_event = traces["traceEvents"][e_id-1]
+            target_event = traces[e_id-1]
             assert target_event["pid"] == event["pid"]
             assert target_event["tid"] == event["tid"]
             assert target_event["ts"] == event["ts"]
-            if event["id"] not in flow_id_to_events:
-                flow_id_to_events[event["id"]] = [None, None, event["cat"]]
-            flow_id_to_events[event["id"]][1] = e_id-1
-            
-    flow_event_to_event = {}
-    for _id, (se, te, cat) in flow_id_to_events.items():
-        # TODO (huhanpeng): need to use the following assertation
-        assert se is not None, (id)
-        assert te is not None, (id)
-        if se is None or te is None:
-            continue
-        # print(se["name"][:100], "  ->  ", te["name"][:100])
-        flow_event_to_event[se] = (te, cat)
-    return pid2info, flow_event_to_event
+            if event["id"] not in flow_keyed_by_id:
+                flow_keyed_by_id[event["id"]] = Flow(event["id"], event["cat"])
+            flow_keyed_by_id[event["id"]].register_out_event(e_id-1)
+        
+    return pid2info, flow_keyed_by_id
     
-pid2info, flow_event_to_event = extract_pid_and_flow_info(torch_traces)
+pid2info, flow_keyed_by_id = extract_pid_and_flow_info(torch_traces)
 
 def event_cmp_func(o1, o2):
     e_id1, e1 = o1
@@ -89,11 +117,10 @@ def event_cmp_func(o1, o2):
         return e1["ts"] - e2["ts"]
     
 sorted_traces = sorted(
-    [(e_id, e) for e_id, e in enumerate(torch_traces["traceEvents"]) if 
+    [(e_id, e) for e_id, e in enumerate(torch_traces) if 
         (isinstance(e["pid"], int) or e["pid"].isdigit()) and e["ph"] == "X"],
     key=cmp_to_key(event_cmp_func))
-min_ts = sorted_traces[0]["ts"]
-
+min_ts = sorted_traces[0][1]["ts"]
 
 def read_yes(prompt):
     inp = input(f"{prompt} (Y/n): ")
@@ -101,7 +128,7 @@ def read_yes(prompt):
         return True
     else:
         return False
-    
+
 class TraceTreeNode:
     def __init__(self, e_id, event, sorted_e_id):
         self.e_id = e_id
@@ -113,37 +140,55 @@ class TraceTreeNode:
         self.childs = []
         self.parent = None
         
+        # Flow ids that starts from this event or its child events
+        if "in_flow_ids" in event["args"]:
+            self.in_flow_ids = set(event["args"]["in_flow_ids"])
+        else:
+            self.in_flow_ids = set()
+        
+        # Flow ids that ends with this event or its child events
+        if "out_flow_ids" in event["args"]:
+            self.out_flow_ids = set(event["args"]["out_flow_ids"])
+        else:
+            self.out_flow_ids = set()
+        
         # For leaf node with cuda event, cuda_ts and cuda_dur correspond to the cuda event
         # For non-leaf node which invokes cuda operations, cuda_ts and cuda_dur correspond to
         # the cuda events of the child leaf nodes
+        self.cuda_event = None
+        self.cuda_ts = None
+        self.cuda_dur = None
         if event["cat"] in ["kernel", "gpu_memcpy"]:
             self.cuda_ts = event["ts"]
             self.cuda_dur = event["dur"]
-        
-        if e_id in flow_event_to_event:
-            te_id, cat = flow_event_to_event[e_id]
-            if cat == "ac2g":
-                # CPU to GPU dependency
-                self.cuda_event = torch_traces["traceEvents"][te_id]
+            
+        in_ac2g_flow_ids = [flow_id for flow_id in self.in_flow_ids if flow_keyed_by_id[flow_id].is_cpu2gpu]
+        assert len(in_ac2g_flow_ids) <= 1
+        if len(in_ac2g_flow_ids) == 1:
+            # CPU to GPU dependency
+            flow = flow_keyed_by_id[in_ac2g_flow_ids[0]]
+            gpu_e_id = flow.out_e_id
+            if gpu_e_id is None:
+                print(f"Warning: the following CPU event has no corresponding GPU event: {torch_traces[flow.in_e_id]}")
+            else:
+                self.cuda_event = torch_traces[gpu_e_id]
                 self.cuda_ts = self.cuda_event["ts"]
                 self.cuda_dur = self.cuda_event["dur"]
-            elif cat == "fwdbwd":
-                # fwd to bwd dependency
-                raise 
-            else:
-                raise ValueError(f"Invalid flow cat {cat}")
-        else:
-            self.cuda_event = None
-            self.cuda_ts = None
-            self.cuda_dur = None
-        
+                self.cuda_dur = self.cuda_event["dur"]
+
+            
     def add_child(self, node):
         self.childs.append(node)
         node.parent = self
-        
-        self.align_cuda_time_w_child(node)
+        self.align_flow_info_w_child(node)
     
-    def align_cuda_time_w_child(self, child):
+    def align_flow_info_w_child(self, child):
+        # Should be called when traversing the trace tree in post order
+        self.in_flow_ids = self.in_flow_ids.union(child.in_flow_ids)
+        # NOTE: do not align out flow IDs, since we want to know 
+        # the exact GPU event ID or BWD event ID
+        # self.out_flow_ids = self.out_flow_ids.union(child.out_flow_ids)
+        
         if child.cuda_ts is not None:
             if self.cuda_ts is None:
                 self.cuda_ts = child.cuda_ts
@@ -161,18 +206,31 @@ class ProfileLevelDecider:
     def __init__(self):
         pass
     
+    def make_decision(self, node: TraceTreeNode, parents):
+        pass
+    
+    def accept_decision(self, node: TraceTreeNode, decision: str):
+        pass
+    
+    def withdraw_decision(self, node: TraceTreeNode):
+        pass
+    
 class ManualProfileLevelDecider(ProfileLevelDecider):
     def __init__(self):
         super().__init__()
         self.name2decision = {}
-        name2decision_cfg_path = "name2decision_cfg.json"
-        if os.path.exists(name2decision_cfg_path):
-            with open(name2decision_cfg_path, 'r') as fp:
+        self.name2decision_cfg_path = "name2decision_cfg.json"
+        if os.path.exists(self.name2decision_cfg_path):
+            with open(self.name2decision_cfg_path, 'r') as fp:
                 self.name2decision = json.load(fp)
-            print(f"Load name2decision cfg file from {name2decision_cfg_path}")
+            print(f"Load name2decision cfg file from {self.name2decision_cfg_path}")
         
-    def make_decision(self, node, parents):
-        assert node.cuda_ts is not None
+    def make_decision(self, node: TraceTreeNode, parents):
+        if node.cuda_ts is None:
+            # Breakdown those nodes by default
+            print(f"node cuda_ts is None {node.event['name']=}")
+            return 'p'
+        
         if node.event["name"] in self.name2decision:
             # We have seen events with the same, directly make the decision
             decision = self.name2decision[node.event["name"]]
@@ -206,27 +264,67 @@ class ManualProfileLevelDecider(ProfileLevelDecider):
                 inp = "b"
             if inp == 's':
                 print(f"The full name is: {node.event['name']}")
-            elif inp == "u":
-                # Withdraw, re-process the parent node
-                return None, False
             elif inp == "b" and len(node.childs) == 0:
                 print(f"\n!!! Do not allow breakdowning `{node.event['name']}` which has no child")
+            elif inp[0] not in ["b", "p", "g", "k", "u"]:
+                print(f"\n!!! Invalid selection: {inp}")
+            elif inp == "u":
+                # Withdraw, re-process the parent node
+                decision = inp
+                break
             elif inp[0] == "p":
                 if read_yes(f"Do you want to skip node `{node.event['name']}`?"):
                     decision = inp
                     break
-            elif inp[0] not in ["b", "p", "g", "k"]:
-                print(f"\n!!! Invalid selection: {inp}")
             else:
                 # Decision = 'b' or 'g' or 'k'
                 decision = inp
                 break
         return decision
 
+    def accept_decision(self, node: TraceTreeNode, decision: str):
+        node_event_name = node.event["name"]
+        self.name2decision[node_event_name] = decision
+    
+    def withdraw_decision(self, node: TraceTreeNode):
+        node_event_name = node.event["name"]
+        if node_event_name in self.name2decision:
+            self.name2decision.pop(node_event_name)
+    
+    def dump(self):
+        with open(self.name2decision_cfg_path, 'w') as fp:
+            json.dump(self.name2decision, fp, indent=4)
+
 class AutoProfileLevelDecider(ProfileLevelDecider):
-    pass
-
-
+    def __init__(self):
+        super().__init__()
+        # list of (fullname, class_name)
+        self.fullname_order = [(full_name, self.process_class_name(class_name)) for 
+                               (full_name, class_name) in metadata["fullname_order"]]
+        self.ptr = 0
+        
+    def process_class_name(self, class_name):
+        rst = re.search(r"<class '(?P<module_name>[\w\.]+)'>", class_name)
+        assert rst is not None, (class_name)
+        return rst["module_name"].split(".")[-1]
+    
+    def make_decision(self, node: TraceTreeNode, parents):
+        if self.ptr < len(self.fullname_order) and self.fullname_order[self.ptr][1] in node.event["name"]:
+            fullname = self.fullname_order[self.ptr][0]
+            self.ptr += 1
+            in_fwd2bwd_flow_ids = [flow_id for flow_id in self.in_flow_ids if flow_keyed_by_id[flow_id].is_fwd2bwd]
+            if len(in_fwd2bwd_flow_ids) > 0:
+                assert len(in_fwd2bwd_flow_ids) == 1
+                flow_keyed_by_id[in_fwd2bwd_flow_ids[0]].register_fullname(fullname)
+            return f"g {fullname}"
+        elif len(node.out_flow_ids) > 0:
+            assert len(node.out_flow_ids) == 1
+            assert flow_keyed_by_id[node.out_flow_ids[0]].is_fwd2bwd
+            assert flow_keyed_by_id[node.out_flow_ids[0]].fullname is not None
+            return f"g backward/{flow_keyed_by_id[node.out_flow_ids[0]].fullname}"
+        else:
+            return "b"
+            
 
 '''
 The profiler allow users to specify the granularity for trace recording
@@ -256,35 +354,37 @@ class TraceTree:
             self.root_nodes = [node]
         else:
             assert self.node_ptr.l <= node.l, (node.event["name"][:100], self.node_ptr.event["name"][:100])
-            succ = self.add_node(self.node_ptr, node)
+            succ = self._recur_add_node(self.node_ptr, node)
         if succ:
             self.node_ptr = node
         
-    def add_node(self, prev, new):
+    def _recur_add_node(self, prev, new):
         ''' If a node is added, return True, otherwise, return False
         '''
         if new.l >= prev.r:
             # The new node is at the same level as
-            # self:   l       r
+            # prev:   l       r
             # new:              l      r
             if prev.parent is None:
                 # Root nodes
                 self.root_nodes.append(new)
                 return True
             else:
-                prev.parent.align_cuda_time_w_child(prev)
-                return self.add_node(prev.parent, new)
+                prev.parent.align_flow_info_w_child(prev)
+                return self._recur_add_node(prev.parent, new)
         elif new.r <= prev.r:
             # The new node is the child of the current node
-            # self:   l       r
+            # prev:   l       r
             # new:      l   r
             prev.add_child(new)
             return True
         else:
             # The following case is not allowed in the same thread
-            # self:   l       r
+            # prev:   l       r
             # new:      l        r
-            # print(prev.event, new.event)
+            print(prev.event)
+            print(new.event)
+            raise RuntimeError()
             return False
     
     def show(self):
@@ -293,6 +393,7 @@ class TraceTree:
             self._recur_show(node, level)
     
     def _recur_show(self, node, level):
+        raise NotImplementedError()
         msg = "\t" * level
         if node.event["cat"] == "cpu_op":
             msg += "* "
@@ -300,7 +401,7 @@ class TraceTree:
         if node.cuda_ts:
             msg += f" ({node.cuda_ts - min_ts} - {node.cuda_ts + node.cuda_dur - min_ts})"
         if node.e_id in flow_event_to_event:
-            cuda_event = traces["traceEvents"][flow_event_to_event[node.e_id]]
+            cuda_event = traces[flow_event_to_event[node.e_id]]
             msg += f" --> {cuda_event['name'][:100]}"
         print(msg)
         for child in node.childs: 
@@ -327,21 +428,6 @@ class TraceTree:
         proc_next_child: bool
             Set True to process the sibling of this node, i.e., the next child of the parent of this node 
         '''
-        if node.cuda_ts is None:
-            # node.event["name"].startswith("<built-in method") \
-            # or node.event["name"].startswith("<built-in function"):
-            ret_next_child = True
-            ret_events = []
-            # Breakdown those nodes by default
-            for child in node.childs:
-                events, proc_next_child = self._recur_gen_traces(child, parents + [node])
-                if proc_next_child:
-                    ret_events.extend(events)
-                else:
-                    ret_next_child = False
-                    break
-            return ret_events, ret_next_child
-        
         match = re.search(r"(?P<module_name>nn.Module:.*)_\d+", node.event["name"])
         if match is not None:
             node.event["name"] = match.groupdict()["module_name"]
@@ -350,22 +436,27 @@ class TraceTree:
             node.event["name"] = match.groupdict()["module_name"]
         while True:
             decision = self.pld.make_decision(node, parents)
-            node_event_name = node.event["name"]
+            if decision == "u":
+                # Withdraw, re-process the parent node
+                return None, False
+            
             if decision.endswith("*"):
                 decision = decision.split("*")[0]
             else:
-                name2decision[node_event_name] = decision
+                self.pld.accept_decision(node, decision)
+                
             if decision.startswith("g"):
+                # Generate a event for this node
                 event = self.gen_cpu_event_with_cuda_ts(node)
                 if decision.startswith("g ") and len(decision) > 2:
-                    if node_event_name in name2decision:
-                        name2decision.pop(node_event_name)
+                    self.pld.withdraw_decision(node)
                     event["name"] = decision.split("g ")[1]
                 return [event], True
             elif decision == "b":
+                # break down this node
                 re_proc_this_node = False
                 ret_events = []
-                for child_id, child in enumerate(node.childs): 
+                for child_id, child in enumerate(node.childs):
                     events, proc_next_child = self._recur_gen_traces(child, parents + [node])
                     
                     # Double confirm the withdraw operation
@@ -379,12 +470,13 @@ class TraceTree:
                         ret_events.extend(events)
                     else:
                         re_proc_this_node = True
-                        if node_event_name in name2decision:
-                            name2decision.pop(node_event_name)
+                        self.pld.withdraw_decision(node)
                         break
                 if not re_proc_this_node:
                     return ret_events, True
             elif decision.startswith("k"):
+                # Keep all traces under this node, if there is an argument like
+                # `k <path>`, this part of traces will be saved in `<path>` separately
                 sorted_e_id = node.sorted_e_id
                 events = self.keep_all_traces(node)
                 if decision.startswith("k ") and len(decision) > 2:
@@ -399,6 +491,7 @@ class TraceTree:
                     events = []
                 return events, True
             elif decision == "p":
+                # Pass this node and its child nodes
                 return [], True
         raise RuntimeError("Not expected")
     
@@ -480,7 +573,10 @@ for sorted_e_id, (e_id, event) in enumerate(sorted_traces):
         pid_to_trace_tree[event["pid"]] = {}
     if event["tid"] not in pid_to_trace_tree[event["pid"]]:
         pid_to_trace_tree[event["pid"]][event["tid"]] = TraceTree()
-    if event["ph"] == "X":
+    if event["ph"] == "X" and "ProfilerStep" not in event["name"] \
+        and "#SGD.zero_grad" not in event["name"] \
+        and "#SGD.step" not in event["name"]:
+        # TODO(huhanpeng): why #SGD.zero_grad weird
         # print(event["pid"], event["tid"], event["ts"], event["name"][:100])
         pid_to_trace_tree[event["pid"]][event["tid"]].add_event(e_id, event, sorted_e_id)
 
@@ -506,5 +602,3 @@ with open(output_file, 'w') as fp:
     }, fp)
 
 
-with open(name2decision_cfg_path, 'w') as fp:
-    json.dump(name2decision, fp, indent=4)
