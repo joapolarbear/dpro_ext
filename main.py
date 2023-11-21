@@ -1,31 +1,10 @@
 import os
 import numpy as np
-import datetime
-from contextlib import nullcontext
 
 import torch
-from torch.profiler import ProfilerActivity
 from torch.autograd import Variable
 
 from recorder import Recorder
-
-use_profiler = False
-if use_profiler:
-    tensorboard_dir = "./logs"
-    os.makedirs(tensorboard_dir, exist_ok=True)
-    ct = datetime.datetime.now()
-    profiler = torch.profiler.profile(
-            activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU],
-            schedule=torch.profiler.schedule(wait=5, warmup=2, active=1, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(tensorboard_dir, ct.strftime("%Y%m%d-%H%M%S"))),
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=True,
-            with_flops=True,
-            with_modules=True
-        )
-else:
-    profiler = nullcontext()
 
 # Model definition
 inp_size = 1024
@@ -61,7 +40,7 @@ else:
     labels = Variable(torch.from_numpy(y_train))
     
 # Training    
-with profiler as prof:
+with recorder as prof:
     for epoch in range(epochs):
         # Clear gradient buffers because we don't want any gradient from previous epoch to carry forward, dont want to cummulate gradients
         optimizer.zero_grad()
@@ -79,7 +58,6 @@ with profiler as prof:
 
         print('epoch {}, loss {}'.format(epoch, loss.item()))
         
-        if hasattr(prof, 'step'):
-            prof.step()
+        prof.step()
             
 recorder.summary()

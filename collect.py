@@ -3,53 +3,80 @@ import json
 from functools import cmp_to_key
 import re
 
-f = sys.argv[1]
+log_dir = sys.argv[1]
 
-print("Trace loading ... ")
-with open(f, 'r') as fp:
-    traces = json.load(fp)
+def load_torch_profiler_rst(torch_profiler_path):
+    print(f"Torch Profiler Trace loading at {torch_profiler_path[:50]} ... ")
+    with open(torch_profiler_path, 'r') as fp:
+        traces = json.load(fp)
+    return traces
 
-pid2info = {}
-flow_record = {}
-pid2trace_tree = {}
-print("Stat pid info ... ")
-for e_id, event in enumerate(traces["traceEvents"]):
-    if event["ph"] == 'M':
-        if event["pid"] not in pid2info:
-            pid2info[event["pid"]] = {"threads": {}}
-        if event["name"] == "process_name":
-            pid2info[event["pid"]]["process_name"] = event["args"]["name"]
-        elif event["name"] == "process_labels":
-            pid2info[event["pid"]]["process_labels"] = event["args"]["labels"]
-        elif event["name"] == "thread_name":
-            pid2info[event["pid"]]["threads"][event["tid"]] = event["args"]["name"]
-    elif event["ph"] == "s":
-        source_event = traces["traceEvents"][e_id-1]
-        assert source_event["pid"] == event["pid"]
-        assert source_event["tid"] == event["tid"]
-        assert source_event["ts"] == event["ts"]
-        # TODO what's the usage of the `cat` and `name` fields for this flow evnet
-        if event["id"] not in flow_record:
-            flow_record[event["id"]] = [None, None]
-        flow_record[event["id"]][0] = e_id-1
-    elif event["ph"] == "f":
-        target_event = traces["traceEvents"][e_id-1]
-        assert target_event["pid"] == event["pid"]
-        assert target_event["tid"] == event["tid"]
-        assert target_event["ts"] == event["ts"]
-        if event["id"] not in flow_record:
-            flow_record[event["id"]] = [None, None]
-        flow_record[event["id"]][1] = e_id-1
+def load(log_dir):
+    fullname_order_path = os.path.join(log_dir, "metadata.json")
+    if not os.path.exists(fullname_order_path):
+        print(f"Metadata is not available under the directory {log_dir}")
+    with open(fullname_order_path, 'r') as fp:
+        metadata = json.load(fp)
+        
+    _root, _dirs, _files = list(os.walk(log_dir))[0]
+    if len(_dirs) > 0:
+        _dirs = sorted([d for d in _dirs if re.match(r"\d{8}-\d{6}", d)])
+        torch_profiler_dir = os.path.join(_root, _dirs[-1])
+        print(f"There are multiple torch profiler traces, choose the latest one: {torch_profiler_dir}")
+    else:
+        torch_profiler_dir = os.path.join(_root, _dirs[0])
+    files = os.listdir(torch_profiler_dir)
+    assert len(files) == 1
+    torch_profiler_path = os.path.join(torch_profiler_dir, (files[0]))
+    torch_traces = load_torch_profiler_rst(torch_profiler_path)
+    return metadata, torch_traces
 
-min_ts = traces["traceEvents"][0]["ts"]
-flow_mapping = {}
-for _id, (se, te) in flow_record.items():
-    # assert se is not None, (id)
-    # assert te is not None, (id)
-    if se is None or te is None:
-        continue
-    # print(se["name"][:100], "  ->  ", te["name"][:100])
-    flow_mapping[se] = te
+metadata, torch_traces = load(log_dir)
+
+def extract_pid_and_flow_info(traces):
+    pid2info = {}
+    flow_id_to_events = {}
+    print("Stat pid info ... ")
+    for e_id, event in enumerate(traces["traceEvents"]):
+        if event["ph"] == 'M':
+            if event["pid"] not in pid2info:
+                pid2info[event["pid"]] = {"threads": {}}
+            if event["name"] == "process_name":
+                pid2info[event["pid"]]["process_name"] = event["args"]["name"]
+            elif event["name"] == "process_labels":
+                pid2info[event["pid"]]["process_labels"] = event["args"]["labels"]
+            elif event["name"] == "thread_name":
+                pid2info[event["pid"]]["threads"][event["tid"]] = event["args"]["name"]
+        elif event["ph"] == "s":
+            source_event = traces["traceEvents"][e_id-1]
+            assert source_event["pid"] == event["pid"]
+            assert source_event["tid"] == event["tid"]
+            assert source_event["ts"] == event["ts"]
+            # TODO what's the usage of the `cat` and `name` fields for this flow evnet
+            if event["id"] not in flow_id_to_events:
+                flow_id_to_events[event["id"]] = [None, None, event["cat"]]
+            flow_id_to_events[event["id"]][0] = e_id-1
+        elif event["ph"] == "f":
+            target_event = traces["traceEvents"][e_id-1]
+            assert target_event["pid"] == event["pid"]
+            assert target_event["tid"] == event["tid"]
+            assert target_event["ts"] == event["ts"]
+            if event["id"] not in flow_id_to_events:
+                flow_id_to_events[event["id"]] = [None, None, event["cat"]]
+            flow_id_to_events[event["id"]][1] = e_id-1
+            
+    flow_event_to_event = {}
+    for _id, (se, te, cat) in flow_id_to_events.items():
+        # TODO (huhanpeng): need to use the following assertation
+        assert se is not None, (id)
+        assert te is not None, (id)
+        if se is None or te is None:
+            continue
+        # print(se["name"][:100], "  ->  ", te["name"][:100])
+        flow_event_to_event[se] = (te, cat)
+    return pid2info, flow_event_to_event
+    
+pid2info, flow_event_to_event = extract_pid_and_flow_info(torch_traces)
 
 def event_cmp_func(o1, o2):
     e_id1, e1 = o1
@@ -62,17 +89,11 @@ def event_cmp_func(o1, o2):
         return e1["ts"] - e2["ts"]
     
 sorted_traces = sorted(
-    [(e_id, e) for e_id, e in enumerate(traces["traceEvents"]) if (isinstance(e["pid"], int) or e["pid"].isdigit()) and e["ph"] == "X"],
+    [(e_id, e) for e_id, e in enumerate(torch_traces["traceEvents"]) if 
+        (isinstance(e["pid"], int) or e["pid"].isdigit()) and e["ph"] == "X"],
     key=cmp_to_key(event_cmp_func))
+min_ts = sorted_traces[0]["ts"]
 
-
-
-name2decision = {}
-name2decision_cfg_path = "name2decision_cfg.json"
-if os.path.exists(name2decision_cfg_path):
-    with open(name2decision_cfg_path, 'r') as fp:
-        name2decision = json.load(fp)
-    print(f"Load name2decision cfg file from {name2decision_cfg_path}")
 
 def read_yes(prompt):
     inp = input(f"{prompt} (Y/n): ")
@@ -98,10 +119,19 @@ class TraceTreeNode:
         if event["cat"] in ["kernel", "gpu_memcpy"]:
             self.cuda_ts = event["ts"]
             self.cuda_dur = event["dur"]
-        elif e_id in flow_mapping:
-            self.cuda_event = traces["traceEvents"][flow_mapping[e_id]]
-            self.cuda_ts = self.cuda_event["ts"]
-            self.cuda_dur = self.cuda_event["dur"]
+        
+        if e_id in flow_event_to_event:
+            te_id, cat = flow_event_to_event[e_id]
+            if cat == "ac2g":
+                # CPU to GPU dependency
+                self.cuda_event = torch_traces["traceEvents"][te_id]
+                self.cuda_ts = self.cuda_event["ts"]
+                self.cuda_dur = self.cuda_event["dur"]
+            elif cat == "fwdbwd":
+                # fwd to bwd dependency
+                raise 
+            else:
+                raise ValueError(f"Invalid flow cat {cat}")
         else:
             self.cuda_event = None
             self.cuda_ts = None
@@ -127,6 +157,77 @@ def get_flow_cnt():
     FLOW_CNT += 1
     return FLOW_CNT - 1
 
+class ProfileLevelDecider:
+    def __init__(self):
+        pass
+    
+class ManualProfileLevelDecider(ProfileLevelDecider):
+    def __init__(self):
+        super().__init__()
+        self.name2decision = {}
+        name2decision_cfg_path = "name2decision_cfg.json"
+        if os.path.exists(name2decision_cfg_path):
+            with open(name2decision_cfg_path, 'r') as fp:
+                self.name2decision = json.load(fp)
+            print(f"Load name2decision cfg file from {name2decision_cfg_path}")
+        
+    def make_decision(self, node, parents):
+        assert node.cuda_ts is not None
+        if node.event["name"] in self.name2decision:
+            # We have seen events with the same, directly make the decision
+            decision = self.name2decision[node.event["name"]]
+            # print(f"Re-use the decsion {decision} for node {node.event['name'][:200]}")
+            return decision
+            
+        while True:
+            print("\n")
+            print("=" * 100)
+            for level, p_node in enumerate(parents):
+                print("    " * level + p_node.event["name"][:200])
+            print("    " * (len(parents)) + f"{node.event['name'][:200]} <-------------------- Cur Node")
+            # print("    " * (len(parents)+1) + "childs:")
+            for child in node.childs[:12]:
+                print("    " * (len(parents)+1) + f"{child.event['name'][:200]}")
+            if len(node.childs) > 12:
+                for _ in range(3):
+                    print("    " * (len(parents)+1) + f".")
+            print("-" * 100)
+            print(f" s\t\tShow full name of the node")
+            print(f" g\t\tGenerate a event, type `g <customized name>` to change the trace name")
+            print(f" b\t\t(default) Breakdown")
+            print(f" u\t\tUP and undo")
+            print(f" k\t\tKeep all the CPU and GPU events related to this node and all its child, `k <dir>`")
+            print(f" p\t\tPass this node, do nothing")
+            print(" Note: By default, the same decision will be used for the same event, add * after command disable this")
+            inp = input("Please input commands: ")
+            print("=" * 100)
+            # Default operation
+            if len(inp) == 0:
+                inp = "b"
+            if inp == 's':
+                print(f"The full name is: {node.event['name']}")
+            elif inp == "u":
+                # Withdraw, re-process the parent node
+                return None, False
+            elif inp == "b" and len(node.childs) == 0:
+                print(f"\n!!! Do not allow breakdowning `{node.event['name']}` which has no child")
+            elif inp[0] == "p":
+                if read_yes(f"Do you want to skip node `{node.event['name']}`?"):
+                    decision = inp
+                    break
+            elif inp[0] not in ["b", "p", "g", "k"]:
+                print(f"\n!!! Invalid selection: {inp}")
+            else:
+                # Decision = 'b' or 'g' or 'k'
+                decision = inp
+                break
+        return decision
+
+class AutoProfileLevelDecider(ProfileLevelDecider):
+    pass
+
+
+
 '''
 The profiler allow users to specify the granularity for trace recording
 when analyzing the raw output of torch's Profiler in an offline manner. 
@@ -145,6 +246,8 @@ class TraceTree:
     def __init__(self):
         self.root_nodes = []
         self.node_ptr = None
+        
+        self.pld = ManualProfileLevelDecider()
     
     def add_event(self, e_id, new, sorted_e_id):
         node = TraceTreeNode(e_id, new, sorted_e_id)
@@ -196,8 +299,8 @@ class TraceTree:
         msg += node.event["name"][:100]
         if node.cuda_ts:
             msg += f" ({node.cuda_ts - min_ts} - {node.cuda_ts + node.cuda_dur - min_ts})"
-        if node.e_id in flow_mapping:
-            cuda_event = traces["traceEvents"][flow_mapping[node.e_id]]
+        if node.e_id in flow_event_to_event:
+            cuda_event = traces["traceEvents"][flow_event_to_event[node.e_id]]
             msg += f" --> {cuda_event['name'][:100]}"
         print(msg)
         for child in node.childs: 
@@ -246,54 +349,7 @@ class TraceTree:
         if match is not None:
             node.event["name"] = match.groupdict()["module_name"]
         while True:
-            # node.cuda_ts is not None
-            if node.event["name"] in name2decision:
-                # We have seen events with the same, directly make the decision
-                decision = name2decision[node.event["name"]]
-                # print(f"Re-use the decsion {decision} for node {node.event['name'][:200]}")
-            else:
-                while True:
-                    print("\n")
-                    print("=" * 100)
-                    for level, p_node in enumerate(parents):
-                        print("    " * level + p_node.event["name"][:200])
-                    print("    " * (len(parents)) + f"{node.event['name'][:200]} <-------------------- Cur Node")
-                    # print("    " * (len(parents)+1) + "childs:")
-                    for child in node.childs[:12]:
-                        print("    " * (len(parents)+1) + f"{child.event['name'][:200]}")
-                    if len(node.childs) > 12:
-                        for _ in range(3):
-                            print("    " * (len(parents)+1) + f".")
-                    print("-" * 100)
-                    print(f" s\t\tShow full name of the node")
-                    print(f" g\t\tGenerate a event, type `g <customized name>` to change the trace name")
-                    print(f" b\t\t(default) Breakdown")
-                    print(f" u\t\tUP and undo")
-                    print(f" k\t\tKeep all the CPU and GPU events related to this node and all its child, `k <dir>`")
-                    print(f" p\t\tPass this node, do nothing")
-                    print(" Note: By default, the same decision will be used for the same event, add * after command disable this")
-                    inp = input("Please input commands: ")
-                    print("=" * 100)
-                    # Default operation
-                    if len(inp) == 0:
-                        inp = "b"
-                    if inp == 's':
-                        print(f"The full name is: {node.event['name']}")
-                    elif inp == "u":
-                        # Withdraw, re-process the parent node
-                        return None, False
-                    elif inp == "b" and len(node.childs) == 0:
-                        print(f"\n!!! Do not allow breakdowning `{node.event['name']}` which has no child")
-                    elif inp[0] == "p":
-                        if read_yes(f"Do you want to skip node `{node.event['name']}`?"):
-                            decision = inp
-                            break
-                    elif inp[0] not in ["b", "p", "g", "k"]:
-                        print(f"\n!!! Invalid selection: {inp}")
-                    else:
-                        # Decision = 'b' or 'g' or 'k'
-                        decision = inp
-                        break
+            decision = self.pld.make_decision(node, parents)
             node_event_name = node.event["name"]
             if decision.endswith("*"):
                 decision = decision.split("*")[0]
@@ -418,29 +474,29 @@ class TraceTree:
             event["args"]["name_prefix"] = name_prefix
         return event
 
-trace_tree_dict = {}
+pid_to_trace_tree = {}
 for sorted_e_id, (e_id, event) in enumerate(sorted_traces):
-    if event["pid"] not in trace_tree_dict:
-        trace_tree_dict[event["pid"]] = {}
-    if event["tid"] not in trace_tree_dict[event["pid"]]:
-        trace_tree_dict[event["pid"]][event["tid"]] = TraceTree()
+    if event["pid"] not in pid_to_trace_tree:
+        pid_to_trace_tree[event["pid"]] = {}
+    if event["tid"] not in pid_to_trace_tree[event["pid"]]:
+        pid_to_trace_tree[event["pid"]][event["tid"]] = TraceTree()
     if event["ph"] == "X":
         # print(event["pid"], event["tid"], event["ts"], event["name"][:100])
-        trace_tree_dict[event["pid"]][event["tid"]].add_event(e_id, event, sorted_e_id)
+        pid_to_trace_tree[event["pid"]][event["tid"]].add_event(e_id, event, sorted_e_id)
 
 # Show trace trees
-# for pid in trace_tree_dict.keys():
-#     for tid in trace_tree_dict[pid].keys():
+# for pid in pid_to_trace_tree.keys():
+#     for tid in pid_to_trace_tree[pid].keys():
 #         print(f"\n{pid} {tid}")
-#         trace_tree_dict[pid][tid].show()
+#         pid_to_trace_tree[pid][tid].show()
         
 
 rst_traces = []
-for pid in trace_tree_dict.keys():
+for pid in pid_to_trace_tree.keys():
     if pid2info[pid]["process_labels"] != "CPU":
         continue
-    for tid in trace_tree_dict[pid].keys():
-        rst_traces.extend(trace_tree_dict[pid][tid].gen_traces())
+    for tid in pid_to_trace_tree[pid].keys():
+        rst_traces.extend(pid_to_trace_tree[pid][tid].gen_traces())
         
 output_file = "tmp.json"
 print(f"Dump {len(rst_traces)} events to {output_file}") 
