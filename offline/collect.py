@@ -336,6 +336,8 @@ class AutoProfileLevelDecider(ProfileLevelDecider):
                 else:
                     import pdb; pdb.set_trace()
             return f"g backward/{out_flow.fullname}"
+        elif node.event["name"].startswith("aten::"):
+            return "g"
         else:
             return "b"
             
