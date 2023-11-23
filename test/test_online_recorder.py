@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch.autograd import Variable
 
-from recorder import Recorder
+from online.recorder import Recorder
 
 # Model definition
 inp_size = 1024
@@ -21,15 +21,15 @@ elif True:
     model = resnet50()
     x_train, y_train = cnn_dummpy_data(batch_size)
 
+criterion = torch.nn.MSELoss() 
+optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
-recorder = Recorder(model)
+recorder = Recorder([model, criterion], ["", "loss"])
 
 ##### For GPU #######
 if torch.cuda.is_available():
     model.cuda()
-
-criterion = torch.nn.MSELoss() 
-optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    criterion.cuda()
 
 # Converting inputs and labels to Variable
 if torch.cuda.is_available():

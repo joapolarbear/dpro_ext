@@ -7,7 +7,7 @@ import torch
 from torch.profiler import ProfilerActivity
 
 class Recorder:
-    def __init__(self, model, verbose=0, save="./logs", use_profiler=True):
+    def __init__(self, models, names, verbose=0, save="./logs", use_profiler=True):
         self.verbose = verbose
         self.save = save
 
@@ -15,7 +15,13 @@ class Recorder:
         self.hook_handlers = []
         self.fullname_ops = []
         
-        self.recur_register_hook(model)
+        if not isinstance(models, (list, tuple)):
+            models = [models]
+        if not isinstance(names, (list, tuple)):
+            names = [names]
+        assert len(models) == len(names)
+        for model, name in zip(models, names):
+            self.recur_register_hook(model, name)
         
         if use_profiler:
             tensorboard_dir = "./logs"
@@ -73,25 +79,32 @@ class Recorder:
             #     print(inp.grad_fn)
         return hook_fn
 
-    def recur_register_hook(self, module, prefix=""):
+    def _reg_hooks_for_submodules(self, module, name):
+        # Register hooks for submodules
         sub_modules = module.__dict__['_modules']
-        for name, sub_module in sub_modules.items():
-            sub_module_full_name = f"{prefix}/{name}" if len(prefix) > 0 else name
-            if sub_module is None or isinstance(sub_module, torch.nn.Module) is False:
+        for sub_name, sub_module in sub_modules.items():
+            if sub_module is None:
                 continue
-            if isinstance(sub_module, torch.nn.Container) or \
-                    isinstance(sub_module, torch.nn.Sequential) or \
-                    str(type(sub_module)).startswith("<class 'torchvision.models"):
-                self.recur_register_hook(sub_module, prefix=sub_module_full_name)
-            elif str(type(sub_module)).startswith("<class 'torch.nn.modules") or \
-                    type(sub_module) in self.target_module:
-                handler = sub_module.register_forward_hook(self.make_hook_fn(sub_module_full_name))
-                self.hook_handlers.append(handler)
+            sub_module_full_name = f"{name}/{sub_name}" if len(name) > 0 else sub_name
+            self.recur_register_hook(sub_module, sub_module_full_name)
+    
+    def _reg_hook_implt(self, module, name):
+        handler = module.register_forward_hook(self.make_hook_fn(name))
+        self.hook_handlers.append(handler)
+            
+    def recur_register_hook(self, module, name):
+        if isinstance(module, (torch.nn.Container,
+                torch.nn.Sequential)) or \
+                str(type(module)).startswith("<class 'torchvision.models"):
+            self._reg_hooks_for_submodules(module, name)
+        elif str(type(module)).startswith("<class 'torch.nn") or \
+                type(module) in self.target_module:
+            self._reg_hook_implt(module, name)
+        else:
+            inp = input(f"Encounter module {type(module)}, do you want to more fine-grained traces?[y/N]: ")
+            if inp.lower() in ["1", "y", "yes"]:
+                self._reg_hooks_for_submodules(module, name)
             else:
-                inp = input(f"Encounter module {type(sub_module)}, do you want to more fine-grained traces?[y/N]: ")
-                if inp.lower() in ["1", "y", "yes"]:
-                    self.recur_register_hook(sub_module, prefix=sub_module_full_name)
-                else:
-                    self.target_module.append(type(sub_module))
-                    handler = sub_module.register_forward_hook(self.make_hook_fn(sub_module_full_name))
-                    self.hook_handlers.append(handler)
+                self.target_module.append(type(module))
+                self._reg_hook_implt(module, name)
+    

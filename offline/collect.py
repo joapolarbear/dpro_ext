@@ -146,7 +146,7 @@ class TraceTreeNode:
         else:
             self.in_flow_ids = set()
         
-        # Flow ids that ends with this event or its child events
+        # Flow ids that ends with this event
         if "out_flow_ids" in event["args"]:
             self.out_flow_ids = set(event["args"]["out_flow_ids"])
         else:
@@ -176,6 +176,10 @@ class TraceTreeNode:
                 self.cuda_dur = self.cuda_event["dur"]
                 self.cuda_dur = self.cuda_event["dur"]
 
+    @property
+    def out_flow_id(self):
+        assert len(self.out_flow_ids) == 1
+        return list(self.out_flow_ids)[0]
             
     def add_child(self, node):
         self.childs.append(node)
@@ -203,6 +207,7 @@ def get_flow_cnt():
     return FLOW_CNT - 1
 
 class ProfileLevelDecider:
+    # Decide the profile level
     def __init__(self):
         pass
     
@@ -216,6 +221,7 @@ class ProfileLevelDecider:
         pass
     
 class ManualProfileLevelDecider(ProfileLevelDecider):
+    # Manually decide the profile level in a interactive manner
     def __init__(self):
         super().__init__()
         self.name2decision = {}
@@ -312,16 +318,24 @@ class AutoProfileLevelDecider(ProfileLevelDecider):
         if self.ptr < len(self.fullname_order) and self.fullname_order[self.ptr][1] in node.event["name"]:
             fullname = self.fullname_order[self.ptr][0]
             self.ptr += 1
-            in_fwd2bwd_flow_ids = [flow_id for flow_id in self.in_flow_ids if flow_keyed_by_id[flow_id].is_fwd2bwd]
+
+            # Register the full module name of the flow if exists
+            in_fwd2bwd_flow_ids = [flow_id for flow_id in node.in_flow_ids if flow_keyed_by_id[flow_id].is_fwd2bwd]
             if len(in_fwd2bwd_flow_ids) > 0:
-                assert len(in_fwd2bwd_flow_ids) == 1
-                flow_keyed_by_id[in_fwd2bwd_flow_ids[0]].register_fullname(fullname)
+                for idx, flow_id in enumerate(in_fwd2bwd_flow_ids): 
+                    flow_keyed_by_id[flow_id].register_fullname(f"{fullname}_sub{idx}")
+                
             return f"g {fullname}"
         elif len(node.out_flow_ids) > 0:
-            assert len(node.out_flow_ids) == 1
-            assert flow_keyed_by_id[node.out_flow_ids[0]].is_fwd2bwd
-            assert flow_keyed_by_id[node.out_flow_ids[0]].fullname is not None
-            return f"g backward/{flow_keyed_by_id[node.out_flow_ids[0]].fullname}"
+            out_flow = flow_keyed_by_id[node.out_flow_id]
+            assert out_flow.is_fwd2bwd
+            if out_flow.fullname is None:
+                if node.cuda_ts is None:
+                    # TODO (huhanpeng): ignore those CPU only ops, like aten::view,
+                    pass
+                else:
+                    import pdb; pdb.set_trace()
+            return f"g backward/{out_flow.fullname}"
         else:
             return "b"
             
@@ -345,7 +359,8 @@ class TraceTree:
         self.root_nodes = []
         self.node_ptr = None
         
-        self.pld = ManualProfileLevelDecider()
+        # self.pld = ManualProfileLevelDecider()
+        self.pld = AutoProfileLevelDecider()
     
     def add_event(self, e_id, new, sorted_e_id):
         node = TraceTreeNode(e_id, new, sorted_e_id)
