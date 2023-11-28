@@ -2,11 +2,18 @@ import os, sys
 import json
 from functools import cmp_to_key
 import re
+import argparse
 
 from flow import Flow
 from trace_tree import TraceTree
 
-log_dir = sys.argv[1]
+parser = argparse.ArgumentParser(description="Troch Trace Analysis",
+		formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument("--torch_trace", type=str, default=None, help="torch trace directory")
+parser.add_argument("--output", type=str, default=None, help="output path")
+parser.add_argument("--compare", action="store_true", help="Set true to generate a JSON file that contains both the processed traces and the original torch traces for comparison")
+
+args = parser.parse_args()
 
 def load_torch_profiler_rst(torch_profiler_path):
     print(f"Torch Profiler Trace loading at {torch_profiler_path[:50]} ... ")
@@ -39,7 +46,7 @@ def load(log_dir):
     torch_traces = load_torch_profiler_rst(torch_profiler_path)["traceEvents"]
     return metadata, torch_traces
 
-metadata, torch_traces = load(log_dir)
+metadata, torch_traces = load(args.torch_trace)
  
 def extract_pid_and_flow_info(traces):
     pid2info = {}
@@ -120,11 +127,13 @@ for pid in pid_to_trace_tree.keys():
     for tid in pid_to_trace_tree[pid].keys():
         rst_traces.extend(pid_to_trace_tree[pid][tid].gen_traces())
         
-output_file = "tmp.json"
-print(f"Dump {len(rst_traces)} events to {output_file}") 
+output_file = args.output or "tmp.json"
+if args.compare:
+    print(f"Merge {len(rst_traces)} processed events with the original torch traces, dumped to {output_file}") 
+    rst_traces.extend(torch_traces)
+else:
+    print(f"Dump {len(rst_traces)} events to {output_file}") 
 with open(output_file, 'w') as fp:
     json.dump({
         "traceEvents": rst_traces
-    }, fp)
-
-
+    }, fp, indent=4)
