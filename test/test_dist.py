@@ -30,26 +30,30 @@ print(f"{world_size=} {rank=} {args.local_rank=} {backend=} {is_nccl_available=}
 
 torch.cuda.set_device(args.local_rank)
 
-def profile_allreduce(print=print):
+def profile_allreduce(para_num_in_m=512, print=print):
     assert dist.is_initialized()
-    n = 1 * 1024 * 1024 * 1024
+    para_num = int(para_num_in_m * 1e6)
+    size_GB = para_num * 4 * 2 / 1024 / 1024 / 1024
 
-    x = torch.randn(n).cuda(torch.cuda.current_device())
-    if dist.get_rank() == 0:
-        print("Profiling AllReduce... NCCL ENVs:")
-        for k in os.environ:
-            if k.startswith("NCCL"):
-                print(f'{k} = {os.environ[k]}')
+    x = torch.randn(para_num).cuda(torch.cuda.current_device())
     stats = []
-    for _ in range(10):
+    for _ in range(20):
         dist.barrier()
         t = time.time()
         dist.all_reduce(x)
         torch.cuda.synchronize()
-        MBps = n * 4 * 2 / (time.time() - t) / 1e9
+        MBps = size_GB / (time.time() - t)
         stats.append(MBps)
     if dist.get_rank() == 0:
-        speed = np.mean(stats)
-        print(f"Allreduce speed = {speed:.3f} GB/s")
-        
-profile_allreduce(print=print)
+        speed = max(stats)
+        stat_str = ",".join([f"{e:.0f}" for e in stats])
+        print(f"Allreduce {size_GB:.3f} GB ==> [{stat_str}] == {speed:.3f} GB/s")
+    
+if dist.get_rank() == 0:
+    print("Profiling AllReduce... NCCL ENVs:")
+    for k in os.environ:
+        if k.startswith("NCCL"):
+            print(f'{k} = {os.environ[k]}')
+            
+for para_num_in_m in [64, 512, 1024]:
+    profile_allreduce(para_num_in_m=para_num_in_m, print=print)
