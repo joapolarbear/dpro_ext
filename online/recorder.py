@@ -3,6 +3,8 @@ import json
 from contextlib import nullcontext
 import datetime
 
+from utils.metadata import RuntimeInfo
+
 import torch
 from torch.profiler import ProfilerActivity
 
@@ -61,7 +63,7 @@ class Recorder:
     def summary(self):
         if self.verbose > 0:
             for x in self.fullname_ops:
-                print(x)
+                x.dumps()
                 
         if self.save is not None:
             if not os.path.exists(self.save):
@@ -69,11 +71,20 @@ class Recorder:
             
             save_path = os.path.join(self.save, "metadata.json")
             with open(save_path, 'w') as fp:
-                json.dump({"fullname_order": self.fullname_ops}, fp, indent=4)
+                json.dump({"fullname_order": [list(runtime_info) for 
+                    runtime_info in self.fullname_ops]}, fp,
+                    # indent=4
+                    )
         
     def make_hook_fn(self, name):
         def hook_fn(module, input, output):
-            self.fullname_ops.append((name, str(type(module))))
+            runtime_info = RuntimeInfo(
+                full_name=name, 
+                module_name=str(type(module)),
+                para_shapes=[list(p.shape) for p in module.parameters()],
+                para_dtypes=[str(p.dtype) for p in module.parameters()],
+                para_requires_grad=[p.requires_grad for p in module.parameters()])
+            self.fullname_ops.append(runtime_info)
             # print(name, output.shape, output.grad_fn)
             # for inp in input:
             #     print(inp.grad_fn)
