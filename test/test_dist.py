@@ -44,6 +44,7 @@ def profile_allreduce(para_num_in_m=512, print=print):
         torch.cuda.synchronize()
         MBps = size_GB / (time.time() - t)
         stats.append(MBps)
+        time.sleep(0.1)
     if dist.get_rank() == 0:
         speed = max(stats)
         stat_str = ",".join([f"{e:.0f}" for e in stats])
@@ -55,5 +56,5 @@ if dist.get_rank() == 0:
         if k.startswith("NCCL"):
             print(f'{k} = {os.environ[k]}')
             
-for para_num_in_m in [64, 512, 1024]:
+for para_num_in_m in [1, 64, 128, 512, 1024]:
     profile_allreduce(para_num_in_m=para_num_in_m, print=print)
