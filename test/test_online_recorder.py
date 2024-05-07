@@ -39,25 +39,33 @@ else:
     inputs = Variable(torch.from_numpy(x_train))
     labels = Variable(torch.from_numpy(y_train))
     
-# Training    
-with recorder as prof:
-    for epoch in range(epochs):
-        # Clear gradient buffers because we don't want any gradient from previous epoch to carry forward, dont want to cummulate gradients
-        optimizer.zero_grad()
 
-        # get output from the model, given the inputs
-        outputs = model(inputs)
+from online.flops_profiler import WrapFlopsProfiler
+ds_engine = False
+flops_prof = WrapFlopsProfiler(model, ds_engine if ds_engine else None)
 
-        # get loss for the predicted output
-        loss = criterion(outputs, labels)
-        # get gradients w.r.t to parameters
-        loss.backward(retain_graph=False)
 
-        # update parameters
-        optimizer.step()
+# Training
+with flops_prof as fprof:  
+    with recorder as prof:
+        for epoch in range(epochs):
+            # Clear gradient buffers because we don't want any gradient from previous epoch to carry forward, dont want to cummulate gradients
+            optimizer.zero_grad()
+            
+            # get output from the model, given the inputs
+            outputs = model(inputs)
 
-        print('epoch {}, loss {}'.format(epoch, loss.item()))
-        
-        prof.step()
+            # get loss for the predicted output
+            loss = criterion(outputs, labels)
+            # get gradients w.r.t to parameters
+            loss.backward(retain_graph=False)
+
+            # update parameters
+            optimizer.step()
+
+            print('epoch {}, loss {}'.format(epoch, loss.item()))
+            
+            prof.step()
+            fprof.step()
             
 recorder.summary()
